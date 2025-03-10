@@ -118,17 +118,32 @@ Use the following `values.yaml`:
 
 ```yaml
 githubConfigUrl: https://github.com/<your_enterprise/org/repo>
-githubConfigSecret: ...
+githubConfigSecret:
+  github_token: "..."
 template:
   spec:
     serviceAccountName: kubevirt-actions-runner
     containers:
       - name: runner
-        image: ghcr.io/zhaofengli/kubevirt-actions-runner:latest
+        image: container-registry.local:5000/kubevirt-actions-runner:latest
         command: []
         env:
           - name: KUBEVIRT_VM_TEMPLATE
             value: vm-template
+          #query this via rest-api https://docs.github.com/en/rest/actions/workflows?apiVersion=2022-11-28#list-repository-workflows
+          - name: GITHUB_WORKFLOW_ID
+            value: "..."
+          - name: GITHUB_ORG
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.labels['actions.github.com/organization']
+          - name: GITHUB_REPO
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.labels['actions.github.com/repository']
+          #TODO: DON'T EXPOSE THE TOKEN LIKE THIS!
+          - name: GITHUB_TOKEN
+            value: "..."
 ```
 
 ```bash

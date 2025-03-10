@@ -12,6 +12,8 @@ use kube::{
     runtime::{wait::delete::delete_and_finalize, watcher},
     Client,
 };
+use regex::Regex;
+use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::signal::unix::{signal, SignalKind};
@@ -189,6 +191,11 @@ struct Opts {
     /// The VirtualMachine resource to use as the template.
     #[clap(long, env = "KUBEVIRT_VM_TEMPLATE")]
     vm_template: String,
+
+    /// TODO: this is not optimal. Lets rework this mechanism
+    /// The workflow id to serve with resources
+    #[clap(long, env = "GITHUB_WORKFLOW_ID")]
+    github_workflow_id: String,
 }
 
 impl VmiOutcome {
@@ -214,7 +221,144 @@ async fn main() {
     }
 }
 
+async fn fetch_kernel_version(opts: &Opts) -> Result<String, Box<dyn std::error::Error>> {
+    //TODO: Handle errors by retrying the REST API calls n times.
+    let org = env::var("GITHUB_ORG").expect("GITHUB_ORG not set");
+    let repo = env::var("GITHUB_REPO").expect("GITHUB_REPO not set");
+    let token = env::var("GITHUB_TOKEN").expect("GITHUB_TOKEN not set");
+    let workflow_id = &opts.github_workflow_id;
+    let mut kernel_version = "";
+    // let mut kernel_tree = "";
+    // let mut kernel_commit_sha = "";
+
+    //TODO: This does not work in a scenario with multiple workflow triggers
+    //
+    //Fetching the latest workflow run, which we further on use to get the run_id of the completed
+    //sub-job that contains the evaluated variables for building the kernel.
+    let runs = format!(
+        "https://api.github.com/repos/{org}/{repo}/actions/workflows/{workflow_id}/runs?per_page=1"
+    );
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        ACCEPT,
+        HeaderValue::from_static("application/vnd.github+json"),
+    );
+    headers.insert(
+        "X-GitHub-Api-Version",
+        HeaderValue::from_static("2022-11-28"),
+    );
+    headers.insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {}", token))?,
+    );
+    headers.insert(
+        USER_AGENT,
+        HeaderValue::from_static("kubevirt-actions-runner"),
+    );
+
+    let client = reqwest::Client::new();
+    let response = client.get(&runs).headers(headers.clone()).send().await?;
+
+    let runs_status = response.status();
+    if !runs_status.is_success() {
+        panic!("Bad status code: {runs_status}");
+    }
+    let runs_text = response.text().await?;
+
+    let runs: Value = serde_json::from_str(&runs_text)?;
+
+    let run = runs["workflow_runs"]
+        .as_array()
+        .and_then(|arr| arr.get(0))
+        .ok_or_else(|| "No successful runs found")?;
+
+    let run_id = run["id"].as_u64().expect("Run ID not found");
+
+    // Get the completed job for the specific run
+    let jobs_url = format!(
+        "https://api.github.com/repos/{org}/{repo}/actions/runs/{run_id}/jobs?status=completed"
+    );
+    let jobs_response = client
+        .get(&jobs_url)
+        .headers(headers.clone())
+        .send()
+        .await?;
+
+    let jobs_status = jobs_response.status();
+    if !jobs_status.is_success() {
+        panic!("Bad status code for jobs query: {runs_status}");
+    }
+    let jobs_text = jobs_response.text().await?;
+
+    let jobs: Value = serde_json::from_str(&jobs_text)?;
+
+    let job = jobs["jobs"]
+        .as_array()
+        .and_then(|arr| arr.get(0))
+        .ok_or_else(|| "No jobs found")?;
+
+    let job_id = job["id"].as_u64().expect("Job ID not found");
+
+    tracing::info!("Fetching kernel information for run_id='{run_id}' and job_id='{job_id}'");
+    // Get the logs for the specific job
+    let logs_url = format!(
+        "https://api.github.com/repos/{}/{}/actions/jobs/{}/logs",
+        org, repo, job_id
+    );
+    let logs_response = client.get(&logs_url).headers(headers).send().await?;
+
+    let logs_status = logs_response.status();
+    if !logs_status.is_success() {
+        panic!("Bad status code for logs query: {logs_status}");
+    }
+
+    let logs_text = logs_response.text().await?;
+
+    // Extract the value of KERNEL_VERSION from the logs
+    let re_commit_sha = Regex::new(r#"KERNEL_VERSION:\s*(.*)"#)?;
+    if let Some(captures) = re_commit_sha.captures(&logs_text) {
+        if let Some(var_value) = captures.get(1) {
+            tracing::info!("Found KERNEL_VERSION='{}'", var_value.as_str());
+            kernel_version = var_value.as_str();
+        } else {
+            panic!("KERNEL_VERSION not found in logs");
+        }
+    } else {
+        panic!("KERNEL_VERSION not found in logs");
+    }
+    Ok(kernel_version.to_string())
+}
+
+fn replace_kernel_version(data: &mut BTreeMap<String, Value>, kernel_version: &str) {
+    for (_, value) in data.iter_mut() {
+        replace_in_value(value, kernel_version);
+    }
+}
+
+fn replace_in_value(value: &mut Value, kernel_version: &str) {
+    match value {
+        Value::String(s) => {
+            if s.contains("{{ kernel_version }}") {
+                *s = s.replace("{{ kernel_version }}", kernel_version);
+            }
+        }
+        Value::Object(map) => {
+            for (_, v) in map.iter_mut() {
+                replace_in_value(v, kernel_version);
+            }
+        }
+        Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                replace_in_value(v, kernel_version);
+            }
+        }
+        _ => {}
+    }
+}
+
 async fn run(opts: Opts) -> AnyResult<()> {
+    let kernel_version = fetch_kernel_version(&opts).await.unwrap();
     let vmi_name = opts.name;
     let runner_info = if let Some(jitconfig) = &opts.jitconfig {
         RunnerInfo::Jit(JitRunnerInfo {
@@ -223,12 +367,14 @@ async fn run(opts: Opts) -> AnyResult<()> {
     } else {
         let runner_url = opts.url.ok_or(()).or_else(|_| {
             let base = env::var("GITHUB_URL").unwrap_or_else(|_| "https://github.com/".to_string());
-            let repo = env::var("RUNNER_REPO")
-                .ok()
-                .and_then(|v| if v.is_empty() { None } else { Some(v) });
-            let org = env::var("RUNNER_ORG")
-                .ok()
-                .and_then(|v| if v.is_empty() { None } else { Some(v) });
+            let repo =
+                env::var("RUNNER_REPO")
+                    .ok()
+                    .and_then(|v| if v.is_empty() { None } else { Some(v) });
+            let org =
+                env::var("RUNNER_ORG")
+                    .ok()
+                    .and_then(|v| if v.is_empty() { None } else { Some(v) });
 
             let path = match (org, repo) {
                 (Some(_), Some(_)) => {
@@ -280,6 +426,7 @@ async fn run(opts: Opts) -> AnyResult<()> {
     let vmis: Api<VirtualMachineInstance> =
         Api::namespaced_with(client.clone(), namespace, &vmi_resource);
 
+    //TODO: what happens here if we spawn multiple runner jobs at the same time?
     if vmis.get_opt(&vmi_name).await?.is_some() {
         tracing::info!("The VMI already exists (were we killed?) - Deleting");
         delete_and_finalize(vmis.clone(), &vmi_name, &DeleteParams::default())
@@ -288,26 +435,48 @@ async fn run(opts: Opts) -> AnyResult<()> {
     }
 
     let template = vms.get(&opts.vm_template).await?;
+    //TODO: adjust the "runner" vm name -> this might solve the issue of concurrency
 
+    println!("template: {:?}", template);
     let mut vmi = VirtualMachineInstance::new("vmi", &vmi_resource, template.spec.template.spec);
+    println!("vmi: {:?}", vmi);
     vmi.metadata = template.spec.template.metadata;
     vmi.metadata.name = Some(vmi_name.clone());
     vmi.metadata
         .annotations
         .get_or_insert_with(Default::default)
-        .insert(RUNNER_INFO_ANNOTATION.to_string(), serde_json::to_string(&runner_info)?);
+        .insert(
+            RUNNER_INFO_ANNOTATION.to_string(),
+            serde_json::to_string(&runner_info)?,
+        );
+    println!("BEFORE vmi.spec.data: {:?}", vmi.spec.data);
+    replace_kernel_version(&mut vmi.spec.data, kernel_version.as_str());
+    println!("AFTER vmi.spec.data: {:?}", vmi.spec.data);
+    // vmi.spec.domain.firmware.kernelBoot.container.image = Some(format!(
+    //     "container-registry.local:5000/fedora-containerdisk:{kernel_version}"
+    // ));
+
+    //template.metadata.name = runner
+    //template.spec.domain.firmware.kernelBoot.container.image
+    //template.spec.domain.firmware.kernelBoot.container.initrdPath
+    //template.spec.domain.firmware.kernelBoot.container.kernelPath
+
+    //println!("vmi volumes: {:?}", vmi.spec.volumes);
 
     let mut data = BTreeMap::new();
-    data.insert("downwardAPI".to_string(), serde_json::json!({
-        "fields": [
-            {
-                "path": RUNNER_INFO_PATH,
-                "fieldRef": {
-                    "fieldPath": format!("metadata.annotations['{}']", RUNNER_INFO_ANNOTATION)
+    data.insert(
+        "downwardAPI".to_string(),
+        serde_json::json!({
+            "fields": [
+                {
+                    "path": RUNNER_INFO_PATH,
+                    "fieldRef": {
+                        "fieldPath": format!("metadata.annotations['{}']", RUNNER_INFO_ANNOTATION)
+                    }
                 }
-            }
-        ]
-    }));
+            ]
+        }),
+    );
 
     let volumes = vmi.spec.volumes.get_or_insert_with(Default::default);
     if let Some(volume) = volumes.iter_mut().find(|v| v.name == RUNNER_INFO_VOLUME) {
