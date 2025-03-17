@@ -141,9 +141,6 @@ template:
             valueFrom:
               fieldRef:
                 fieldPath: metadata.labels['actions.github.com/repository']
-          #TODO: DON'T EXPOSE THE TOKEN LIKE THIS!
-          - name: GITHUB_TOKEN
-            value: "..."
 ```
 
 ```bash

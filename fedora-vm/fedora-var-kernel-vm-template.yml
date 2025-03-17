@@ -2,7 +2,6 @@ apiVersion: kubevirt.io/v1
 kind: VirtualMachine
 metadata:
   name: vm-template
-  namespace: vm-runner-test
 spec:
   runStrategy: Manual
   template:
@@ -34,6 +33,11 @@ spec:
           interfaces:
             - name: default
               masquerade: {}
+          hostDevices:
+            - name: nvme-zns-0
+              deviceName: devices.kubevirt.io/nvme-wdc-zn540
+            - name: nvme-conv-0
+              deviceName: devices.kubevirt.io/nvme-wdc-sn640
         cpu:
           cores: 4
         resources:

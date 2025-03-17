@@ -5,6 +5,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result as AnyResult};
 use clap::Parser;
 use futures::StreamExt;
+use k8s_openapi::api::core::v1::Secret;
 use kube::{
     api::{Api, DeleteParams, PostParams},
     core::{NotUsed, Object, ObjectMeta},
@@ -222,14 +223,28 @@ async fn main() {
 }
 
 async fn fetch_kernel_version(opts: &Opts) -> Result<String, Box<dyn std::error::Error>> {
+    //Fetch the GITHUB_TOKEN secret
+    let client = Client::try_default().await?;
+    let secrets: Api<Secret> = Api::namespaced(client.clone(), client.default_namespace());
+    let gh_token_secret = secrets
+        .get(format!("github-config-secret").as_str())
+        .await?;
+    let data = gh_token_secret
+        .data
+        .ok_or("GitHub config secret data is missing")?;
+    let gh_token = data
+        .get("github_token")
+        .ok_or("github_token is missing")?
+        .0
+        .clone();
+
     //TODO: Handle errors by retrying the REST API calls n times.
+    //Start REST API calls with the help of the previoursly fetched token
+    let token = String::from_utf8(gh_token)?;
     let org = env::var("GITHUB_ORG").expect("GITHUB_ORG not set");
     let repo = env::var("GITHUB_REPO").expect("GITHUB_REPO not set");
-    let token = env::var("GITHUB_TOKEN").expect("GITHUB_TOKEN not set");
     let workflow_id = &opts.github_workflow_id;
     let mut kernel_version = "";
-    // let mut kernel_tree = "";
-    // let mut kernel_commit_sha = "";
 
     //TODO: This does not work in a scenario with multiple workflow triggers
     //
@@ -359,6 +374,8 @@ fn replace_in_value(value: &mut Value, kernel_version: &str) {
 
 async fn run(opts: Opts) -> AnyResult<()> {
     let kernel_version = fetch_kernel_version(&opts).await.unwrap();
+    //TODO: alternatively the RUNNER_NAME var could be set to include the run-id or patch-id?
+    //let vmi_name = format!("{}-{}", opts.name, kernel_version);
     let vmi_name = opts.name;
     let runner_info = if let Some(jitconfig) = &opts.jitconfig {
         RunnerInfo::Jit(JitRunnerInfo {
@@ -437,9 +454,7 @@ async fn run(opts: Opts) -> AnyResult<()> {
     let template = vms.get(&opts.vm_template).await?;
     //TODO: adjust the "runner" vm name -> this might solve the issue of concurrency
 
-    println!("template: {:?}", template);
     let mut vmi = VirtualMachineInstance::new("vmi", &vmi_resource, template.spec.template.spec);
-    println!("vmi: {:?}", vmi);
     vmi.metadata = template.spec.template.metadata;
     vmi.metadata.name = Some(vmi_name.clone());
     vmi.metadata
@@ -449,19 +464,7 @@ async fn run(opts: Opts) -> AnyResult<()> {
             RUNNER_INFO_ANNOTATION.to_string(),
             serde_json::to_string(&runner_info)?,
         );
-    println!("BEFORE vmi.spec.data: {:?}", vmi.spec.data);
     replace_kernel_version(&mut vmi.spec.data, kernel_version.as_str());
-    println!("AFTER vmi.spec.data: {:?}", vmi.spec.data);
-    // vmi.spec.domain.firmware.kernelBoot.container.image = Some(format!(
-    //     "container-registry.local:5000/fedora-containerdisk:{kernel_version}"
-    // ));
-
-    //template.metadata.name = runner
-    //template.spec.domain.firmware.kernelBoot.container.image
-    //template.spec.domain.firmware.kernelBoot.container.initrdPath
-    //template.spec.domain.firmware.kernelBoot.container.kernelPath
-
-    //println!("vmi volumes: {:?}", vmi.spec.volumes);
 
     let mut data = BTreeMap::new();
     data.insert(
