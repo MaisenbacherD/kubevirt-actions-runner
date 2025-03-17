@@ -19,12 +19,15 @@ spec:
               initrdPath: /boot/initramfs-{{ kernel_version }}.img
               kernelPath: /boot/bzImage-{{ kernel_version }}
               imagePullPolicy: Always
-            kernelArgs: console=ttyS0
+            kernelArgs: "no_timer_check console=tty1 console=ttyS0,115200n8 systemd=off root=/dev/vda4 rootflags=subvol=root"
         devices:
           filesystems:
             - name: runner-info
               virtiofs: {}
           disks:
+            - name: containerdisk
+              disk:
+                bus: virtio
             - name: cloudinitdisk
               disk:
                 bus: virtio
@@ -40,6 +43,9 @@ spec:
         - name: default
           pod: {}
       volumes:
+        - name: containerdisk
+          containerDisk:
+            image: quay.io/containerdisks/fedora:41
         - name: cloudinitdisk
           cloudInitNoCloud:
             userData: |-
