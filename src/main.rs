@@ -315,7 +315,7 @@ async fn fetch_kernel_version(opts: &Opts) -> Result<String, Box<dyn std::error:
 
     let job_id = job["id"].as_u64().expect("Job ID not found");
 
-    tracing::info!("Fetching kernel information for run_id='{run_id}' and job_id='{job_id}'");
+    tracing::info!("Fetching kernel information for workflow_id='{workflow_id}', run_id='{run_id}' and job_id='{job_id}'");
     // Get the logs for the specific job
     let logs_url = format!(
         "https://api.github.com/repos/{}/{}/actions/jobs/{}/logs",
