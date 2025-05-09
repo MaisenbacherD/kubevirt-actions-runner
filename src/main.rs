@@ -250,9 +250,8 @@ async fn fetch_kernel_version(opts: &Opts) -> Result<String, Box<dyn std::error:
     //
     //Fetching the latest workflow run, which we further on use to get the run_id of the completed
     //sub-job that contains the evaluated variables for building the kernel.
-    let runs = format!(
-        "https://api.github.com/repos/{org}/{repo}/actions/workflows/{workflow_id}/runs?per_page=1"
-    );
+    let runs =
+        format!("https://api.github.com/repos/{org}/{repo}/actions/workflows/{workflow_id}/runs");
 
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -277,16 +276,24 @@ async fn fetch_kernel_version(opts: &Opts) -> Result<String, Box<dyn std::error:
 
     let runs_status = response.status();
     if !runs_status.is_success() {
-        panic!("Bad status code: {runs_status}");
+        return Err(format!("Bad status code: {runs_status}").into());
     }
     let runs_text = response.text().await?;
 
-    let runs: Value = serde_json::from_str(&runs_text)?;
+    let runs_json: Value = serde_json::from_str(&runs_text)?;
 
-    let run = runs["workflow_runs"]
+    let mut runs = runs_json["workflow_runs"]
         .as_array()
-        .and_then(|arr| arr.get(0))
-        .ok_or_else(|| "No successful runs found")?;
+        .ok_or("Missing 'workflow_runs' array")?
+        .clone();
+
+    runs.sort_by(|a, b| {
+        b["run_started_at"]
+            .as_str()
+            .cmp(&a["run_started_at"].as_str())
+    });
+
+    let run = runs.first().ok_or("No runs found")?;
 
     let run_id = run["id"].as_u64().expect("Run ID not found");
 
@@ -302,7 +309,7 @@ async fn fetch_kernel_version(opts: &Opts) -> Result<String, Box<dyn std::error:
 
     let jobs_status = jobs_response.status();
     if !jobs_status.is_success() {
-        panic!("Bad status code for jobs query: {runs_status}");
+        return Err(format!("Bad status code for job query {runs_status}").into());
     }
     let jobs_text = jobs_response.text().await?;
 
@@ -325,7 +332,7 @@ async fn fetch_kernel_version(opts: &Opts) -> Result<String, Box<dyn std::error:
 
     let logs_status = logs_response.status();
     if !logs_status.is_success() {
-        panic!("Bad status code for logs query: {logs_status}");
+        return Err(format!("Bad status code for logs query: {logs_status}").into());
     }
 
     let logs_text = logs_response.text().await?;
@@ -337,10 +344,10 @@ async fn fetch_kernel_version(opts: &Opts) -> Result<String, Box<dyn std::error:
             tracing::info!("Found KERNEL_VERSION='{}'", var_value.as_str());
             kernel_version = var_value.as_str();
         } else {
-            panic!("KERNEL_VERSION not found in logs");
+            return Err(format!("KERNEL_VERSION not found in logs").into());
         }
     } else {
-        panic!("KERNEL_VERSION not found in logs");
+        return Err(format!("KERNEL_VERSION not found in logs").into());
     }
     Ok(kernel_version.to_string())
 }

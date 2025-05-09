@@ -54,7 +54,7 @@ spec:
       volumes:
         - name: containerdisk
           containerDisk:
-            image: quay.io/containerdisks/fedora:41
+            image: quay.io/containerdisks/fedora:42
         - name: kernel-modules
           containerDisk:
             image: container-registry.local:5000/linux-kernel-containerdisk:linus-master
