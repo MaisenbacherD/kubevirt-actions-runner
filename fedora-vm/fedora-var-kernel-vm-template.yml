@@ -57,7 +57,7 @@ spec:
             image: quay.io/containerdisks/fedora:42
         - name: kernel-modules
           containerDisk:
-            image: container-registry.local:5000/linux-kernel-containerdisk:linus-master
+            image: container-registry.local:5000/linux-kernel-containerdisk:{{ kernel_version }}
             path: /boot/kernel-modules.isofs
             imagePullPolicy: Always
         - name: prepare-nvme-devices

@@ -489,6 +489,9 @@ async fn run(opts: Opts) -> AnyResult<()> {
     );
 
     let volumes = vmi.spec.volumes.get_or_insert_with(Default::default);
+    for volume in volumes.iter_mut() {
+        replace_kernel_version(&mut volume.data, kernel_version.as_str());
+    }
     if let Some(volume) = volumes.iter_mut().find(|v| v.name == RUNNER_INFO_VOLUME) {
         volume.data = data;
     } else {
