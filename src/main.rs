@@ -7,8 +7,8 @@ use clap::Parser;
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::Secret;
 use kube::{
-    api::{Api, DeleteParams, PostParams},
-    core::{NotUsed, Object, ObjectMeta},
+    api::{Api, DeleteParams, ListParams, PostParams},
+    core::{NotUsed, Object, ObjectList, ObjectMeta, PartialObjectMeta},
     discovery,
     runtime::{wait::delete::delete_and_finalize, watcher},
     Client,
@@ -22,6 +22,8 @@ use tokio::signal::unix::{signal, SignalKind};
 const RUNNER_INFO_ANNOTATION: &str = "li.zhaofeng.kubevirt-actions-runner/runner-info";
 const RUNNER_INFO_VOLUME: &str = "runner-info";
 const RUNNER_INFO_PATH: &str = "runner-info.json";
+const KERNEL_LABEL: &str = "kernel-version";
+const BUILDER_JOB_ID_LABEL: &str = "job-identifier";
 
 type VirtualMachine = Object<VirtualMachineSpec, NotUsed>;
 type VirtualMachineInstance = Object<VirtualMachineInstanceSpec, VirtualMachineInstanceStatus>;
@@ -143,7 +145,7 @@ enum VmiOutcome {
     WatchInterrupted,
 }
 
-#[derive(Parser, Debug)]
+#[derive(Clone, Parser, Debug)]
 struct Opts {
     /// The namespace to operate in.
     ///
@@ -218,21 +220,26 @@ async fn main() {
         eprintln!("Exiting in 10 seconds...");
         tokio::time::sleep(Duration::from_secs(10)).await;
 
-        std::process::exit(1);
+        //TODO: See if exiting with no error helps not bringing down the whole listener service?
+        std::process::exit(0);
     }
 }
 
-async fn fetch_kernel_version(opts: &Opts) -> Result<String, Box<dyn std::error::Error>> {
+async fn fetch_kernel_version(opts: Opts, vmis: &Api<VirtualMachineInstance>) -> Result<(String,String), Box<dyn std::error::Error>> {
     //Fetch the GITHUB_TOKEN secret
     let client = Client::try_default().await?;
-    let secrets: Api<Secret> = Api::namespaced(client.clone(), client.default_namespace());
+    let namespace = opts
+        .namespace
+        .as_deref()
+        .unwrap_or(client.default_namespace());
+    let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
     let gh_token_secret = secrets
         .get(format!("github-config-secret").as_str())
         .await?;
-    let data = gh_token_secret
+    let gh_token_secret_data = gh_token_secret
         .data
         .ok_or("GitHub config secret data is missing")?;
-    let gh_token = data
+    let gh_token = gh_token_secret_data
         .get("github_token")
         .ok_or("github_token is missing")?
         .0
@@ -244,14 +251,6 @@ async fn fetch_kernel_version(opts: &Opts) -> Result<String, Box<dyn std::error:
     let org = env::var("GITHUB_ORG").expect("GITHUB_ORG not set");
     let repo = env::var("GITHUB_REPO").expect("GITHUB_REPO not set");
     let workflow_id = &opts.github_workflow_id;
-    let mut kernel_version = "";
-
-    //TODO: This does not work in a scenario with multiple workflow triggers
-    //
-    //Fetching the latest workflow run, which we further on use to get the run_id of the completed
-    //sub-job that contains the evaluated variables for building the kernel.
-    let runs =
-        format!("https://api.github.com/repos/{org}/{repo}/actions/workflows/{workflow_id}/runs");
 
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -272,6 +271,13 @@ async fn fetch_kernel_version(opts: &Opts) -> Result<String, Box<dyn std::error:
     );
 
     let client = reqwest::Client::new();
+
+    //Fetching the latest workflow run, which we further on use to get the run_id of the completed
+    //sub-job that contains the evaluated variables for building the kernel.
+    //TODO: only fetch runs that are still running (but only finished the kernel build job)
+    let runs =
+        format!("https://api.github.com/repos/{org}/{repo}/actions/workflows/{workflow_id}/runs");
+
     let response = client.get(&runs).headers(headers.clone()).send().await?;
 
     let runs_status = response.status();
@@ -293,63 +299,75 @@ async fn fetch_kernel_version(opts: &Opts) -> Result<String, Box<dyn std::error:
             .cmp(&a["run_started_at"].as_str())
     });
 
-    let run = runs.first().ok_or("No runs found")?;
+    for run in runs {
+        let run_id = run["id"].as_u64().expect("Run ID not found");
 
-    let run_id = run["id"].as_u64().expect("Run ID not found");
+        // Get the completed job for the specific run
+        let jobs_url = format!(
+            "https://api.github.com/repos/{org}/{repo}/actions/runs/{run_id}/jobs?status=completed"
+        );
+        let jobs_response = client
+            .get(&jobs_url)
+            .headers(headers.clone())
+            .send()
+            .await?;
 
-    // Get the completed job for the specific run
-    let jobs_url = format!(
-        "https://api.github.com/repos/{org}/{repo}/actions/runs/{run_id}/jobs?status=completed"
-    );
-    let jobs_response = client
-        .get(&jobs_url)
-        .headers(headers.clone())
-        .send()
-        .await?;
+        let jobs_status = jobs_response.status();
+        if !jobs_status.is_success() {
+            return Err(format!("Bad status code for job query {runs_status}").into());
+        }
+        let jobs_text = jobs_response.text().await?;
 
-    let jobs_status = jobs_response.status();
-    if !jobs_status.is_success() {
-        return Err(format!("Bad status code for job query {runs_status}").into());
-    }
-    let jobs_text = jobs_response.text().await?;
+        let jobs: Value = serde_json::from_str(&jobs_text)?;
 
-    let jobs: Value = serde_json::from_str(&jobs_text)?;
+        let job = jobs["jobs"]
+            .as_array()
+            .and_then(|arr| arr.get(0))
+            .ok_or_else(|| "No jobs found")?;
 
-    let job = jobs["jobs"]
-        .as_array()
-        .and_then(|arr| arr.get(0))
-        .ok_or_else(|| "No jobs found")?;
+        let builder_job_id = job["id"].as_u64().expect("Kernel builder job ID not found");
 
-    let job_id = job["id"].as_u64().expect("Job ID not found");
+        //Check if we already have a VMI scheduled for this run.
+        let label = format!("wid.{workflow_id}-rid.{run_id}-jid.{builder_job_id}");
+        let lp = ListParams::default().labels(format!("{BUILDER_JOB_ID_LABEL}={label}").as_str());
+        let list: ObjectList<PartialObjectMeta<VirtualMachineInstance>> = vmis.list_metadata(&lp).await?;
+        if list.items.len() > 0 {
+            tracing::info!("Found already deployed VMI for workflow_id='{workflow_id}', run_id='{run_id}' and builder_job_id='{builder_job_id}'. Finding next job to serve...");
+            //TODO: can we maybe enforce the runner to just pick up this job within the VM?
+            continue;
+        } else {
+            tracing::info!("Fetching kernel information for workflow_id='{workflow_id}', run_id='{run_id}' and builder_job_id='{builder_job_id}'");
+        }
+        // Get the logs for the specific job
+        let logs_url = format!(
+            "https://api.github.com/repos/{}/{}/actions/jobs/{}/logs",
+            org, repo, builder_job_id
+        );
+        let logs_response = client.get(&logs_url).headers(headers).send().await?;
 
-    tracing::info!("Fetching kernel information for workflow_id='{workflow_id}', run_id='{run_id}' and job_id='{job_id}'");
-    // Get the logs for the specific job
-    let logs_url = format!(
-        "https://api.github.com/repos/{}/{}/actions/jobs/{}/logs",
-        org, repo, job_id
-    );
-    let logs_response = client.get(&logs_url).headers(headers).send().await?;
+        let logs_status = logs_response.status();
+        if !logs_status.is_success() {
+            return Err(format!("Bad status code for logs query: {logs_status}").into());
+        }
 
-    let logs_status = logs_response.status();
-    if !logs_status.is_success() {
-        return Err(format!("Bad status code for logs query: {logs_status}").into());
-    }
+        let logs_text = logs_response.text().await?;
 
-    let logs_text = logs_response.text().await?;
-
-    // Extract the value of KERNEL_VERSION from the logs
-    let re_commit_sha = Regex::new(r#"KERNEL_VERSION:\s*(.*)"#)?;
-    if let Some(captures) = re_commit_sha.captures(&logs_text) {
-        if let Some(var_value) = captures.get(1) {
-            tracing::info!("Found KERNEL_VERSION='{}'", var_value.as_str());
-            kernel_version = var_value.as_str();
+        // Extract the value of KERNEL_VERSION from the logs
+        let kernel_version;
+        let re_commit_sha = Regex::new(r#"KERNEL_VERSION:\s*(.*)"#)?;
+        if let Some(captures) = re_commit_sha.captures(&logs_text) {
+            if let Some(var_value) = captures.get(1) {
+                tracing::info!("Found KERNEL_VERSION='{}'", var_value.as_str());
+                kernel_version = var_value.as_str();
+            } else {
+                return Err(format!("KERNEL_VERSION not found in logs").into());
+            }
         } else {
             return Err(format!("KERNEL_VERSION not found in logs").into());
         }
-    } else {
-        return Err(format!("KERNEL_VERSION not found in logs").into());
+        return Ok((kernel_version.to_string(), label));
     }
-    Ok(kernel_version.to_string())
+    Err("No runs found!".into())
 }
 
 fn replace_kernel_version(data: &mut BTreeMap<String, Value>, kernel_version: &str) {
@@ -380,9 +398,7 @@ fn replace_in_value(value: &mut Value, kernel_version: &str) {
 }
 
 async fn run(opts: Opts) -> AnyResult<()> {
-    let kernel_version = fetch_kernel_version(&opts).await.unwrap();
-    //TODO: alternatively the RUNNER_NAME var could be set to include the run-id or patch-id?
-    //let vmi_name = format!("{}-{}", opts.name, kernel_version);
+    let opts_clone = opts.clone();
     let vmi_name = opts.name;
     let runner_info = if let Some(jitconfig) = &opts.jitconfig {
         RunnerInfo::Jit(JitRunnerInfo {
@@ -450,7 +466,8 @@ async fn run(opts: Opts) -> AnyResult<()> {
     let vmis: Api<VirtualMachineInstance> =
         Api::namespaced_with(client.clone(), namespace, &vmi_resource);
 
-    //TODO: what happens here if we spawn multiple runner jobs at the same time?
+    let (kernel_version, label) = fetch_kernel_version(opts_clone, &vmis).await.unwrap();
+
     if vmis.get_opt(&vmi_name).await?.is_some() {
         tracing::info!("The VMI already exists (were we killed?) - Deleting");
         delete_and_finalize(vmis.clone(), &vmi_name, &DeleteParams::default())
@@ -459,7 +476,6 @@ async fn run(opts: Opts) -> AnyResult<()> {
     }
 
     let template = vms.get(&opts.vm_template).await?;
-    //TODO: adjust the "runner" vm name -> this might solve the issue of concurrency
 
     let mut vmi = VirtualMachineInstance::new("vmi", &vmi_resource, template.spec.template.spec);
     vmi.metadata = template.spec.template.metadata;
@@ -470,6 +486,20 @@ async fn run(opts: Opts) -> AnyResult<()> {
         .insert(
             RUNNER_INFO_ANNOTATION.to_string(),
             serde_json::to_string(&runner_info)?,
+        );
+    vmi.metadata
+        .labels
+        .get_or_insert_with(Default::default)
+        .insert(
+            BUILDER_JOB_ID_LABEL.to_string(),
+            label,
+        );
+    vmi.metadata
+        .labels
+        .get_or_insert_with(Default::default)
+        .insert(
+            KERNEL_LABEL.to_string(),
+            kernel_version.clone(),
         );
     replace_kernel_version(&mut vmi.spec.data, kernel_version.as_str());
 
