@@ -276,7 +276,7 @@ async fn fetch_kernel_version(opts: Opts, vmis: &Api<VirtualMachineInstance>) ->
     //sub-job that contains the evaluated variables for building the kernel.
     //TODO: only fetch runs that are still running (but only finished the kernel build job)
     let runs =
-        format!("https://api.github.com/repos/{org}/{repo}/actions/workflows/{workflow_id}/runs");
+        format!("https://api.github.com/repos/{org}/{repo}/actions/workflows/{workflow_id}/runs?status=queued");
 
     let response = client.get(&runs).headers(headers.clone()).send().await?;
 
@@ -304,7 +304,7 @@ async fn fetch_kernel_version(opts: Opts, vmis: &Api<VirtualMachineInstance>) ->
 
         // Get the completed job for the specific run
         let jobs_url = format!(
-            "https://api.github.com/repos/{org}/{repo}/actions/runs/{run_id}/jobs?status=completed"
+            "https://api.github.com/repos/{org}/{repo}/actions/runs/{run_id}/jobs"
         );
         let jobs_response = client
             .get(&jobs_url)
@@ -323,16 +323,21 @@ async fn fetch_kernel_version(opts: Opts, vmis: &Api<VirtualMachineInstance>) ->
         let job = jobs["jobs"]
             .as_array()
             .and_then(|arr| arr.get(0))
-            .ok_or_else(|| "No jobs found")?;
+            .ok_or_else(|| "No job found that is supposed to build/announce the kernel version")?;
 
         let builder_job_id = job["id"].as_u64().expect("Kernel builder job ID not found");
+
+        if job["conclusion"].as_str() != Some("success") {
+            tracing::info!("Kernel build (/version announce) job is not ready workflow_id='{workflow_id}' and run_id='{run_id}' builder_job_id='{builder_job_id}'. Finding next run to serve...");
+            continue;
+        }
 
         //Check if we already have a VMI scheduled for this run.
         let label = format!("wid.{workflow_id}-rid.{run_id}-jid.{builder_job_id}");
         let lp = ListParams::default().labels(format!("{BUILDER_JOB_ID_LABEL}={label}").as_str());
         let list: ObjectList<PartialObjectMeta<VirtualMachineInstance>> = vmis.list_metadata(&lp).await?;
         if list.items.len() > 0 {
-            tracing::info!("Found already deployed VMI for workflow_id='{workflow_id}', run_id='{run_id}' and builder_job_id='{builder_job_id}'. Finding next job to serve...");
+            tracing::info!("Found already deployed VMI for workflow_id='{workflow_id}', run_id='{run_id}' and builder_job_id='{builder_job_id}'. Finding next run to serve...");
             //TODO: can we maybe enforce the runner to just pick up this job within the VM?
             continue;
         } else {
