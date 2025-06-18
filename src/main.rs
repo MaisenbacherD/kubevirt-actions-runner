@@ -220,8 +220,7 @@ async fn main() {
         eprintln!("Exiting in 10 seconds...");
         tokio::time::sleep(Duration::from_secs(10)).await;
 
-        //TODO: See if exiting with no error helps not bringing down the whole listener service?
-        std::process::exit(0);
+        std::process::exit(1);
     }
 }
 
@@ -404,7 +403,8 @@ fn replace_in_value(value: &mut Value, kernel_version: &str) {
 
 async fn run(opts: Opts) -> AnyResult<()> {
     let opts_clone = opts.clone();
-    let vmi_name = opts.name;
+    //TODO: This does not work? The PatchID that is issued by the listener app seams to not be unique.
+    //let vmi_name = opts.name;
     let runner_info = if let Some(jitconfig) = &opts.jitconfig {
         RunnerInfo::Jit(JitRunnerInfo {
             jitconfig: jitconfig.clone(),
@@ -440,7 +440,7 @@ async fn run(opts: Opts) -> AnyResult<()> {
         tracing::info!("Runner URL: {}", runner_url);
 
         RunnerInfo::Legacy(LegacyRunnerInfo {
-            name: vmi_name.clone(),
+            name: opts.name,
             token: opts.token.expect("A token is required"),
             url: runner_url,
             ephemeral: opts.ephemeral,
@@ -473,11 +473,10 @@ async fn run(opts: Opts) -> AnyResult<()> {
 
     let (kernel_version, label) = fetch_kernel_version(opts_clone, &vmis).await.unwrap();
 
+    let vmi_name = format!("runner-{label}");
     if vmis.get_opt(&vmi_name).await?.is_some() {
-        tracing::info!("The VMI already exists (were we killed?) - Deleting");
-        delete_and_finalize(vmis.clone(), &vmi_name, &DeleteParams::default())
-            .await
-            .context("Failed to delete existing VMI")?;
+        tracing::info!("The VMI already exists. Exiting for retry...");
+        return Err(anyhow!("The VMI already exists. Exiting for retry..."));
     }
 
     let template = vms.get(&opts.vm_template).await?;
